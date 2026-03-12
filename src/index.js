@@ -123,11 +123,30 @@ async function fetchPageHtml(r2, projectId) {
   return obj;
 }
 
+// ── Global Memoization Cache ─────────────────────────────────────────────────
+// These persist as long as the Worker isolate is warm.
+// Greatly reduces KV read quota usage for high-traffic assets.
+const templateCache = new Map();
+
+async function getTemplateMeta(kv, type) {
+  if (templateCache.has(type)) {
+    return templateCache.get(type);
+  }
+  const raw = await kv.get(`__tmpl__${type}`);
+  if (!raw) return null;
+  try {
+    const meta = JSON.parse(raw);
+    templateCache.set(type, meta);
+    return meta;
+  } catch (e) {
+    return null;
+  }
+}
+
 // ── Main handler ──────────────────────────────────────────────────────────────
 
 export default {
   async fetch(request, env, ctx) {
-    // ── Global try/catch: graceful 500 on any unexpected infrastructure failure ──
     try {
       return await handleRequest(request, env, ctx);
     } catch (err) {
@@ -155,7 +174,6 @@ async function handleRequest(request, env, ctx) {
     host === 'romancespace.885201314.xyz' || host === 'www.885201314.xyz' || host.includes('workers.dev');
 
   if (isMainDomain) {
-    // Reject any non-GET write attempts — all writes go to the VPS backend
     if (method !== 'GET') {
       return new Response(
         JSON.stringify({ error: 'Write operations are handled by the VPS backend API.' }),
@@ -165,21 +183,20 @@ async function handleRequest(request, env, ctx) {
 
     // ── GET /assets/{type}/{...filepath} — static template assets
     if (path.startsWith('/assets/')) {
-      const parts = path.split('/'); // ['', 'assets', type, ...rest]
+      const parts = path.split('/'); 
       const type = parts[2];
       const filePath = parts.slice(3).join('/');
 
-      const tmplRaw = await env.ROMANCESPACE_KV.get(`__tmpl__${type}`);
-      if (!tmplRaw) return new Response('Not found', { status: 404 });
-      const { version } = JSON.parse(tmplRaw);
+      const meta = await getTemplateMeta(env.ROMANCESPACE_KV, type);
+      if (!meta) return new Response('Not found', { status: 404 });
 
-      const obj = await env.ROMANCESPACE_R2.get(`templates/${type}/${version}/${filePath}`);
+      const obj = await env.ROMANCESPACE_R2.get(`templates/${type}/${meta.version}/${filePath}`);
       if (!obj) return new Response('Asset not found', { status: 404 });
 
       return new Response(obj.body, {
         headers: {
           'Content-Type': getMime(filePath),
-          'Cache-Control': 'public, max-age=604800, immutable', // 7 days for assets
+          'Cache-Control': 'public, max-age=31536000, immutable', // 1 year (asset is versioned by parent folder)
           ...SEC_HEADERS,
         },
       });
@@ -188,13 +205,12 @@ async function handleRequest(request, env, ctx) {
     // ── GET /preview/{type} — render template with schema defaults
     if (path.startsWith('/preview/')) {
       const type = path.split('/')[2];
-      const tmplRaw = await env.ROMANCESPACE_KV.get(`__tmpl__${type}`);
-      if (!tmplRaw) return new Response('Template not found', { status: 404 });
+      const meta = await getTemplateMeta(env.ROMANCESPACE_KV, type);
+      if (!meta) return new Response('Template not found', { status: 404 });
 
-      const { version } = JSON.parse(tmplRaw);
       const [htmlObj, schemaObj] = await Promise.all([
-        env.ROMANCESPACE_R2.get(`templates/${type}/${version}/index.html`),
-        env.ROMANCESPACE_R2.get(`templates/${type}/${version}/schema.json`),
+        env.ROMANCESPACE_R2.get(`templates/${type}/${meta.version}/index.html`),
+        env.ROMANCESPACE_R2.get(`templates/${type}/${meta.version}/schema.json`),
       ]);
       if (!htmlObj) return new Response('Template HTML missing in R2', { status: 404 });
 
@@ -205,7 +221,6 @@ async function handleRequest(request, env, ctx) {
         if (f.default !== undefined) defaults[f.key] = f.default;
       });
 
-      // Preview is NOT cached (no injectViralFooter on preview)
       return new Response(html.replace(/\{\{(\w+)\}\}/g, (m, k) => escapeHtml(defaults[k] ?? '')), {
         headers: {
           'Content-Type': 'text/html;charset=UTF-8',
@@ -215,12 +230,10 @@ async function handleRequest(request, env, ctx) {
       });
     }
 
-    // Old main domain → redirect to frontend
     if (host === 'romancespace.885201314.xyz') {
       return Response.redirect('https://www.885201314.xyz' + path, 301);
     }
 
-    // www passthrough placeholder (Pages should intercept before Worker normally)
     if (host === 'www.885201314.xyz') {
       return new Response('Frontend works, please configure Cloudflare Pages Custom Domains.', { status: 200 });
     }
@@ -229,27 +242,17 @@ async function handleRequest(request, env, ctx) {
   }
 
   // ── USER SUBDOMAIN ─────────────────────────────────────────────
-  // Pattern: [projectId].885201314.xyz
-
   const subdomain = host.split('.')[0];
 
-  // ── DEFENSE: Strict projectId format validation ────────────────
-  // Only allow alphanumeric characters and hyphens, 1–64 characters.
-  // This immediately blocks: path traversal, null-byte injection,
-  // excessively long hostnames, and non-ASCII attacks.
   if (!/^[a-zA-Z0-9-]{1,64}$/.test(subdomain)) {
     return notFoundResponse();
   }
 
   const isPreview = url.searchParams.has('preview');
 
-  // ── DEFENSE: Limit preview param length ───────────────────────
-  // Prevent cache-busting exhaustion via infinitely-varied ?preview=... strings.
-  // We only care that the param exists; its value is irrelevant to us.
   if (isPreview) {
     const previewVal = url.searchParams.get('preview') ?? '';
     if (previewVal.length > 64) {
-      // Strip the param and treat as normal request
       url.searchParams.delete('preview');
       return Response.redirect(url.toString(), 302);
     }
@@ -267,39 +270,33 @@ async function handleRequest(request, env, ctx) {
       headers: {
         'Content-Type': 'text/html;charset=UTF-8',
         'Cache-Control': 'no-cache, no-store, must-revalidate',
-        Pragma: 'no-cache',
         ...SEC_HEADERS,
       },
     });
   }
 
   // ── Normal mode: Cache API → KV → R2 → Cache ──────────────────
-
-  // 1. Check local Cache API (fastest, free)
   const cacheKey = new Request(`https://cache.rs.internal/${subdomain}`);
   const cached = await caches.default.match(cacheKey);
   if (cached) return cached;
 
-  // 2. Check KV for routing config
   const cfgRaw = await env.ROMANCESPACE_KV.get(subdomain);
   if (!cfgRaw) return notFoundResponse();
 
-  // 3. Fetch pre-rendered HTML from R2 (folder-based path with legacy fallback)
   const obj = await fetchPageHtml(env.ROMANCESPACE_R2, subdomain);
   if (!obj) return notFoundResponse();
 
-  // 4. Inject viral footer
   const html = injectViralFooter(await obj.text());
 
   const response = new Response(html, {
     headers: {
       'Content-Type': 'text/html;charset=UTF-8',
-      'Cache-Control': 'public, max-age=3600', // 1 hour CDN + Cache API
+      'Cache-Control': 'public, max-age=86400, s-maxage=86400', // 24 hours (VPS can purge if needed)
       ...SEC_HEADERS,
     },
   });
 
-  // 5. Cache for subsequent requests at this edge node
   ctx.waitUntil(caches.default.put(cacheKey, response.clone()));
   return response;
 }
+
