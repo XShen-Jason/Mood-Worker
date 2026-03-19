@@ -148,13 +148,6 @@ async function handleRequest(request, env, ctx) {
   const path = url.pathname;
   const method = request.method;
 
-  // ── 0. Doc site passthrough ────────────────────────────────────
-  if (host === 'docs.moodspace.xyz' || host === 'document.moodspace.xyz') {
-    const fwd = new URL(request.url);
-    fwd.hostname = 'emotionalspace-docs.pages.dev';
-    return fetch(fwd.toString(), request);
-  }
-
   // ── /assets/ and /preview/ work on any hostname (incl. workers.dev for local dev) ──
   // www.moodspace.xyz is served by VPS Nginx — Worker never touches it.
 
